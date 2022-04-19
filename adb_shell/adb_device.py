@@ -199,49 +199,52 @@ class _AdbIOManager(object):
             self._send(msg, adb_info)
 
             # 3. Read the response from the device
-            cmd, arg0, maxdata, banner2 = self._read_expected_packet_from_device([constants.AUTH, constants.CNXN], adb_info)
+            cmd, arg0, maxdata, banner2 = self._read_expected_packet_from_device([constants.AUTH, constants.CNXN, constants.STLS], adb_info)
 
-            # 4. If ``cmd`` is not ``b'AUTH'``, then authentication is not necesary and so we are done
-            if cmd != constants.AUTH:
-                return True, maxdata
-
-            # 5. If no ``rsa_keys`` are provided, raise an exception
-            if not rsa_keys:
-                self._transport.close()
-                raise exceptions.DeviceAuthError('Device authentication required, no keys available.')
-
-            # 6. Loop through our keys, signing the last ``banner2`` that we received
-            for rsa_key in rsa_keys:
-                # 6.1. If the last ``arg0`` was not :const:`adb_shell.constants.AUTH_TOKEN`, raise an exception
-                if arg0 != constants.AUTH_TOKEN:
+            # 4. If ``cmd`` is ``b'AUTH'``, we need to do the authentication here
+            if cmd == constants.AUTH:
+                # 5. If no ``rsa_keys`` are provided, raise an exception
+                if not rsa_keys:
                     self._transport.close()
-                    raise exceptions.InvalidResponseError('Unknown AUTH response: %s %s %s' % (arg0, maxdata, banner2))
+                    raise exceptions.DeviceAuthError('Device authentication required, no keys available.')
 
-                # 6.2. Sign the last ``banner2`` and send it in an ``b'AUTH'`` message
-                signed_token = rsa_key.Sign(banner2)
-                msg = AdbMessage(constants.AUTH, constants.AUTH_SIGNATURE, 0, signed_token)
+                # 6. Loop through our keys, signing the last ``banner2`` that we received
+                for rsa_key in rsa_keys:
+                    # 6.1. If the last ``arg0`` was not :const:`adb_shell.constants.AUTH_TOKEN`, raise an exception
+                    if arg0 != constants.AUTH_TOKEN:
+                        self._transport.close()
+                        raise exceptions.InvalidResponseError('Unknown AUTH response: %s %s %s' % (arg0, maxdata, banner2))
+
+                    # 6.2. Sign the last ``banner2`` and send it in an ``b'AUTH'`` message
+                    signed_token = rsa_key.Sign(banner2)
+                    msg = AdbMessage(constants.AUTH, constants.AUTH_SIGNATURE, 0, signed_token)
+                    self._send(msg, adb_info)
+
+                    # 6.3. Read the response from the device
+                    cmd, arg0, maxdata, banner2 = self._read_expected_packet_from_device([constants.CNXN, constants.AUTH], adb_info)
+
+                    # 6.4. If ``cmd`` is ``b'CNXN'``, we are done
+                    if cmd == constants.CNXN:
+                        return True, maxdata
+
+                # 7. None of the keys worked, so send ``rsa_keys[0]``'s public key; if the response does not time out, we must have connected successfully
+                pubkey = rsa_keys[0].GetPublicKey()
+                if not isinstance(pubkey, (bytes, bytearray)):
+                    pubkey = bytearray(pubkey, 'utf-8')
+
+                if auth_callback is not None:
+                    auth_callback(self)
+
+                msg = AdbMessage(constants.AUTH, constants.AUTH_RSAPUBLICKEY, 0, pubkey + b'\0')
                 self._send(msg, adb_info)
 
-                # 6.3. Read the response from the device
-                cmd, arg0, maxdata, banner2 = self._read_expected_packet_from_device([constants.CNXN, constants.AUTH], adb_info)
+                adb_info.transport_timeout_s = auth_timeout_s
+                _, _, maxdata, _ = self._read_expected_packet_from_device([constants.CNXN], adb_info)
+            
+            # TODO: support STLS
+            elif cmd == constants.STLS:
+                return False, 0
 
-                # 6.4. If ``cmd`` is ``b'CNXN'``, we are done
-                if cmd == constants.CNXN:
-                    return True, maxdata
-
-            # 7. None of the keys worked, so send ``rsa_keys[0]``'s public key; if the response does not time out, we must have connected successfully
-            pubkey = rsa_keys[0].GetPublicKey()
-            if not isinstance(pubkey, (bytes, bytearray)):
-                pubkey = bytearray(pubkey, 'utf-8')
-
-            if auth_callback is not None:
-                auth_callback(self)
-
-            msg = AdbMessage(constants.AUTH, constants.AUTH_RSAPUBLICKEY, 0, pubkey + b'\0')
-            self._send(msg, adb_info)
-
-            adb_info.transport_timeout_s = auth_timeout_s
-            _, _, maxdata, _ = self._read_expected_packet_from_device([constants.CNXN], adb_info)
             return True, maxdata
 
     def read(self, expected_cmds, adb_info, allow_zeros=False):
